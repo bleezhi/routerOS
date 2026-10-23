@@ -6,8 +6,8 @@ ESP_GUID=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
 BIOS_GUID=21686148-6449-6e6f-744e-656564454649
 [[ -d /sys/firmware/efi ]] && UEFI=1 || UEFI=0
 
-ask() { dialog --stdout --backtitle "Router installer" "$@" || { clear; echo "Cancelled."; exit 1; }; }
-msg() { dialog --backtitle "Router installer" --msgbox "$1" 12 70; }
+ask() { dialog --backtitle "Router installer" --output-fd 3 "$@" 3>&1 >/dev/tty </dev/tty || { clear >/dev/tty; echo "Cancelled." >/dev/tty; exit 1; }; }
+msg() { dialog --backtitle "Router installer" --msgbox "$1" 12 70 >/dev/tty </dev/tty; }
 die() { msg "$1"; clear; exit 1; }
 cidr2mask() { local p=$1 m="" i; for i in 1 2 3 4; do if ((p>=8)); then m+=255; p=$((p-8)); else m+=$((256-2**(8-p))); p=0; fi; ((i<4)) && m+=.; done; echo "$m"; }
 
@@ -24,7 +24,7 @@ mapfile -t NICS < <(for i in /sys/class/net/*; do n=${i##*/}; [[ $n != lo && -e 
 items=(); for n in "${NICS[@]}"; do items+=("$n" "$(cat /sys/class/net/$n/address) $(cat /sys/class/net/$n/operstate)"); done
 WAN=$(ask --menu "Which interface is WAN (internet side)?" 18 70 8 "${items[@]}")
 items=(); for n in "${NICS[@]}"; do [[ $n != $WAN ]] && items+=("$n" "$(cat /sys/class/net/$n/address)" on); done
-mapfile -t LANS < <(ask --separate-output --checklist "LAN ports (bridged together as br0):" 18 70 8 "${items[@]}")
+LANOUT=$(ask --separate-output --checklist "LAN ports (bridged together as br0):" 18 70 8 "${items[@]}"); mapfile -t LANS <<<"$LANOUT"; [[ -z ${LANS[0]:-} ]] && LANS=()
 ((${#LANS[@]}>=1)) || die "Select at least one LAN port."
 
 WANMODE=$(ask --menu "WAN addressing:" 11 60 2 dhcp "Automatic (DHCP)" static "Static IP")
@@ -206,5 +206,5 @@ grub-mkconfig -o /boot/grub/grub.cfg
 CH
 echo "nameserver 127.0.0.1" > /mnt/etc/resolv.conf
 umount -R /mnt
-dialog --msgbox "Done! Remove the USB and reboot.\n\nLogin: $USERN\nLAN gateway: $LANIP (SSH enabled)" 10 50
+dialog >/dev/tty </dev/tty --msgbox "Done! Remove the USB and reboot.\n\nLogin: $USERN\nLAN gateway: $LANIP (SSH enabled)" 10 50
 clear

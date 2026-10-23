@@ -16,6 +16,8 @@ cp -r /usr/share/archiso/configs/releng "$P"
 
 sed -i "s|^iso_name=.*|iso_name=\"$LOWER\"|; s|^iso_label=.*|iso_label=\"${UPPER}_$(date +%Y%m)\"|; s|^iso_application=.*|iso_application=\"$NAME router live installer\"|; s|^iso_publisher=.*|iso_publisher=\"$NAME\"|" "$P/profiledef.sh"
 
+grep -rlZ "Arch Linux" "$P/syslinux" "$P/grub" "$P/efiboot" 2>/dev/null | xargs -0 -r sed -i "s/Arch Linux install medium/$SAFE installer/g; s/Arch Linux/$SAFE/g"
+
 printf '%s\n' dialog parted gptfdisk dosfstools e2fsprogs ntfs-3g >> "$P/packages.x86_64"
 
 install -Dm755 "$HERE/router-install" "$P/airootfs/usr/local/bin/router-install"
