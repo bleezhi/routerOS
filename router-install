@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# Router installer (runs on the live ISO). Needs temporary internet for pacstrap.
+set -uo pipefail
+[[ $EUID -eq 0 ]] || { echo "run as root"; exit 1; }
+ESP_GUID=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+BIOS_GUID=21686148-6449-6e6f-744e-656564454649
+[[ -d /sys/firmware/efi ]] && UEFI=1 || UEFI=0
+
+ask() { dialog --stdout --backtitle "Router installer" "$@" || { clear; echo "Cancelled."; exit 1; }; }
+msg() { dialog --backtitle "Router installer" --msgbox "$1" 12 70; }
+die() { msg "$1"; clear; exit 1; }
+cidr2mask() { local p=$1 m="" i; for i in 1 2 3 4; do if ((p>=8)); then m+=255; p=$((p-8)); else m+=$((256-2**(8-p))); p=0; fi; ((i<4)) && m+=.; done; echo "$m"; }
+
+DEFNAME=$(cat /etc/router-iso-name 2>/dev/null || echo myrouter)
+
+# ---------- 1. name ----------
+NAME=$(ask --inputbox "Name your router OS (used for hostname and boot menu entry):" 9 64 "$DEFNAME")
+HN=$(echo "$NAME" | tr A-Z a-z | tr -c 'a-z0-9\n-' '-' | sed 's/^-*//; s/-*$//'); HN=${HN:-router}
+BID=$(echo "$NAME" | tr -c 'A-Za-z0-9\n_-' '_')
+
+# ---------- 2. network ----------
+mapfile -t NICS < <(for i in /sys/class/net/*; do n=${i##*/}; [[ $n != lo && -e $i/device ]] && echo "$n"; done)
+((${#NICS[@]}>=2)) || die "Need at least 2 network interfaces (found ${#NICS[@]})."
+items=(); for n in "${NICS[@]}"; do items+=("$n" "$(cat /sys/class/net/$n/address) $(cat /sys/class/net/$n/operstate)"); done
+WAN=$(ask --menu "Which interface is WAN (internet side)?" 18 70 8 "${items[@]}")
+items=(); for n in "${NICS[@]}"; do [[ $n != $WAN ]] && items+=("$n" "$(cat /sys/class/net/$n/address)" on); done
+mapfile -t LANS < <(ask --separate-output --checklist "LAN ports (bridged together as br0):" 18 70 8 "${items[@]}")
+((${#LANS[@]}>=1)) || die "Select at least one LAN port."
+
+WANMODE=$(ask --menu "WAN addressing:" 11 60 2 dhcp "Automatic (DHCP)" static "Static IP")
+if [[ $WANMODE == static ]]; then
+  WANIP=$(ask --inputbox "WAN address/prefix (e.g. 203.0.113.10/24):" 9 60)
+  WANGW=$(ask --inputbox "WAN gateway:" 9 60)
+fi
+LANCIDR=$(ask --inputbox "LAN address/prefix of the router:" 9 60 "192.168.10.1/24")
+LANIP=${LANCIDR%/*}; LANPFX=${LANCIDR#*/}; LANMASK=$(cidr2mask "$LANPFX"); BASE=${LANIP%.*}
+DHCPS=$(ask --inputbox "DHCP range start:" 9 60 "$BASE.100")
+DHCPE=$(ask --inputbox "DHCP range end:" 9 60 "$BASE.250")
+DNSUP=$(ask --inputbox "Upstream DNS servers (space separated):" 9 60 "1.1.1.1 9.9.9.9")
+
+# ---------- 3. disk ----------
+LIVEDEV=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null | head -1); LIVEDISK=""
+[[ -n $LIVEDEV ]] && LIVEDISK=$(lsblk -no PKNAME "$LIVEDEV" 2>/dev/null | head -1)
+items=(); while read -r n s m; do [[ ${n##*/} == "$LIVEDISK" ]] && continue; items+=("$n" "$s $m"); done < <(lsblk -dnpo NAME,SIZE,MODEL -e7,11 | sed 's/ \+/ /g')
+((${#items[@]})) || die "No installable disk found."
+
+MODE=$(ask --menu "Where/how to install?" 14 74 3 \
+  wipe "Wipe a whole disk and use it" \
+  free "Dual-boot: use free (unallocated) space on a disk" \
+  part "Install into an existing partition (it will be formatted)")
+
+TABLE=gpt; ESPP=""; ESP_NEW=0; ROOTP=""; BOOTDISK=""
+
+largest_free() { # disk -> "size start end" in sectors
+  parted -sm "$1" unit s print free 2>/dev/null | awk -F: '$5=="free;"{for(i=2;i<=4;i++)gsub("s","",$i); print $4,$2,$3}' | sort -rn | head -1; }
+find_esp() { lsblk -nlpo NAME,PARTTYPE "$1" | awk -v g=$ESP_GUID 'tolower($2)==g{print $1; exit}'; }
+has_biosboot() { lsblk -nlpo PARTTYPE "$1" | grep -qi "$BIOS_GUID"; }
+newpart() { # disk start end typecode name ; sets NEWP
+  local d=$1 s=$2 e=$3 t=$4 n=$5 before after
+  before=$(lsblk -nlpo NAME "$d")
+  if [[ $TABLE == gpt ]]; then sgdisk -n "0:$s:$e" -t "0:$t" -c "0:$n" "$d" >/dev/null || die "sgdisk failed"
+  else parted -s "$d" mkpart primary "$([[ $t == ef00 ]] && echo fat32 || echo ext4)" "${s}s" "${e}s" || die "parted failed"; fi
+  partprobe "$d"; udevadm settle; sleep 1
+  after=$(lsblk -nlpo NAME "$d")
+  NEWP=$(comm -13 <(sort <<<"$before") <(sort <<<"$after") | head -1)
+  [[ -b $NEWP ]] || die "Could not find newly created partition."
+}
+carve_free() { # disk
+  local d=$1 ss need size s e al
+  ss=$(blockdev --getss "$d"); need=$((8*1024*1024*1024/ss))
+  read -r size s e < <(largest_free "$d")
+  [[ -n ${size:-} ]] && ((size>=need)) || die "No free space >= 8 GiB on $d."
+  al=2048; s=$(( (s+al-1)/al*al ))
+  if ((UEFI)); then
+    ESPP=$(find_esp "$d")
+    if [[ -z $ESPP ]]; then
+      [[ $TABLE == gpt ]] || die "UEFI + MSDOS disk without an ESP is not supported."
+      local es=$((512*1024*1024/ss)); newpart "$d" "$s" $((s+es-1)) ef00 "EFI"; ESPP=$NEWP; ESP_NEW=1; s=$((s+es))
+    fi
+  elif [[ $TABLE == gpt ]] && ! has_biosboot "$d"; then
+    newpart "$d" "$s" $((s+2047)) ef02 "BIOS boot"; s=$((s+2048))
+  fi
+  newpart "$d" "$s" "$e" 8300 "$NAME"; ROOTP=$NEWP; BOOTDISK=$d
+}
+
+case $MODE in
+  wipe|free)
+    DISK=$(ask --menu "Select disk:" 18 74 8 "${items[@]}")
+    if [[ $MODE == wipe ]]; then
+      ask --yesno "ALL DATA on $DISK will be destroyed. Continue?" 8 60 >/dev/null
+      wipefs -af "$DISK" >/dev/null; sgdisk --zap-all "$DISK" >/dev/null; sgdisk -o "$DISK" >/dev/null; partprobe "$DISK"; TABLE=gpt
+    else
+      TABLE=$(parted -sm "$DISK" print | sed -n 2p | cut -d: -f6)
+      [[ $TABLE == gpt || $TABLE == msdos ]] || die "Disk has no usable partition table (use 'wipe')."
+      ask --yesno "Create new partitions in the largest free area of $DISK?\nExisting partitions are not touched." 9 66 >/dev/null
+    fi
+    carve_free "$DISK" ;;
+  part)
+    pitems=(); while read -r n s f l; do d=$(lsblk -no PKNAME "$n"); [[ $d == "$LIVEDISK" ]] && continue; pitems+=("$n" "$s ${f:--} ${l:--}"); done < <(lsblk -lnpo NAME,SIZE,FSTYPE,LABEL,TYPE | awk '$NF=="part"{NF--; print}')
+    ((${#pitems[@]})) || die "No partitions found."
+    ROOTP=$(ask --menu "Select partition (will be FORMATTED):" 20 74 10 "${pitems[@]}")
+    ask --yesno "Format $ROOTP and ALL its data will be lost. Continue?" 8 60 >/dev/null
+    BOOTDISK="/dev/$(lsblk -no PKNAME "$ROOTP")"
+    TABLE=$(parted -sm "$BOOTDISK" print | sed -n 2p | cut -d: -f6)
+    if ((UEFI)); then
+      mapfile -t ESPS < <(lsblk -nlpo NAME,PARTTYPE | awk -v g=$ESP_GUID 'tolower($2)==g{print $1}')
+      ((${#ESPS[@]})) || die "No EFI System Partition found. Create one first."
+      e=(); for x in "${ESPS[@]}"; do e+=("$x" "$(lsblk -dno SIZE "$x")"); done
+      ESPP=$(ask --menu "Which ESP should hold the bootloader?" 14 60 6 "${e[@]}")
+    elif [[ $TABLE == gpt ]] && ! has_biosboot "$BOOTDISK"; then
+      die "BIOS boot + GPT needs a 1 MiB 'BIOS boot' partition on $BOOTDISK. Use free-space mode instead."
+    fi ;;
+esac
+
+# ---------- 4. accounts ----------
+USERN=$(ask --inputbox "Admin username:" 9 50 admin)
+PW1=$(ask --insecure --passwordbox "Password for $USERN:" 9 50); PW2=$(ask --insecure --passwordbox "Repeat password:" 9 50)
+[[ $PW1 == "$PW2" && -n $PW1 ]] || die "Passwords empty or different."
+
+ask --yesno "SUMMARY\n\nName: $NAME ($HN)\nWAN: $WAN ($WANMODE)\nLAN: ${LANS[*]} -> br0 $LANCIDR, DHCP $DHCPS-$DHCPE\nRoot partition: $ROOTP\nESP: ${ESPP:-n/a}\nBoot: $([[ $UEFI == 1 ]] && echo UEFI || echo BIOS)\n\nInstall now?" 18 70 >/dev/null
+
+# ---------- 5. install ----------
+clear
+ping -c1 -W3 archlinux.org >/dev/null 2>&1 || die "No internet in the live system. Plug WAN into a DHCP network and retry."
+mkfs.ext4 -F -L "$HN" "$ROOTP" || die "mkfs failed"
+mount "$ROOTP" /mnt
+if ((UEFI)); then
+  ((ESP_NEW)) && mkfs.fat -F32 "$ESPP"
+  mkdir -p /mnt/boot/efi; mount "$ESPP" /mnt/boot/efi
+fi
+pacstrap -K /mnt base linux linux-firmware intel-ucode amd-ucode grub efibootmgr os-prober ntfs-3g \
+  nftables dnsmasq openssh sudo nano vim iproute2 ethtool tcpdump conntrack-tools || die "pacstrap failed"
+
+KV=$(pacman --sysroot /mnt -Q linux | awk '{print $2}'); KV=${KV%%.arch*}
+(( $(vercmp "$KV" 7.1) >= 0 )) || dialog --msgbox "Installed kernel is $KV (< 7.1). The Arch repos haven't shipped 7.1 yet; update later with pacman -Syu." 8 70
+
+genfstab -U /mnt >> /mnt/etc/fstab
+echo "$HN" > /mnt/etc/hostname
+echo "en_US.UTF-8 UTF-8" > /mnt/etc/locale.gen; echo LANG=en_US.UTF-8 > /mnt/etc/locale.conf
+ln -sf /usr/share/zoneinfo/UTC /mnt/etc/localtime
+printf '%s router\n\\n \\l\n' "$NAME" > /mnt/etc/issue
+
+echo "net.ipv4.ip_forward=1" > /mnt/etc/sysctl.d/99-router.conf
+
+# networkd
+N=/mnt/etc/systemd/network
+if [[ $WANMODE == dhcp ]]; then
+  printf '[Match]\nName=%s\n\n[Network]\nDHCP=yes\n\n[DHCPv4]\nUseDNS=no\n' "$WAN" > $N/10-wan.network
+else
+  printf '[Match]\nName=%s\n\n[Network]\nAddress=%s\nGateway=%s\n' "$WAN" "$WANIP" "$WANGW" > $N/10-wan.network
+fi
+printf '[NetDev]\nName=br0\nKind=bridge\n' > $N/20-br0.netdev
+printf '[Match]\nName=br0\n\n[Network]\nAddress=%s\nConfigureWithoutCarrier=yes\n' "$LANCIDR" > $N/20-br0.network
+for l in "${LANS[@]}"; do printf '[Match]\nName=%s\n\n[Network]\nBridge=br0\n' "$l" > "$N/21-$l.network"; done
+
+# firewall + NAT
+cat > /mnt/etc/nftables.conf <<NFT
+flush ruleset
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    ct state established,related accept
+    ct state invalid drop
+    iif lo accept
+    iifname "br0" accept
+    meta l4proto icmp accept
+    meta l4proto ipv6-icmp accept
+    iifname "$WAN" udp dport 68 accept
+  }
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+    ct state established,related accept
+    iifname "br0" oifname "$WAN" accept
+  }
+}
+table ip nat {
+  chain postrouting {
+    type nat hook postrouting priority 100;
+    oifname "$WAN" masquerade
+  }
+}
+NFT
+
+# DHCP + DNS
+{
+  echo "interface=br0"; echo "bind-dynamic"; echo "no-resolv"; echo "domain-needed"; echo "bogus-priv"; echo "domain=lan"
+  for d in $DNSUP; do echo "server=$d"; done
+  echo "dhcp-range=$DHCPS,$DHCPE,$LANMASK,12h"
+  echo "dhcp-option=option:router,$LANIP"
+  echo "dhcp-option=option:dns-server,$LANIP"
+} > /mnt/etc/dnsmasq.conf
+
+arch-chroot /mnt bash -s <<CH
+set -e
+locale-gen
+useradd -m -G wheel -s /bin/bash "$USERN"
+echo "$USERN:$PW1" | chpasswd
+passwd -l root
+echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
+systemctl enable systemd-networkd nftables dnsmasq sshd
+sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="$NAME"/' /etc/default/grub
+grep -q '^GRUB_DISABLE_OS_PROBER' /etc/default/grub && sed -i 's/^GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub || echo 'GRUB_DISABLE_OS_PROBER=false' >> /etc/default/grub
+if [[ $UEFI == 1 ]]; then grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="$BID"
+else grub-install --target=i386-pc "$BOOTDISK"; fi
+grub-mkconfig -o /boot/grub/grub.cfg
+CH
+echo "nameserver 127.0.0.1" > /mnt/etc/resolv.conf
+umount -R /mnt
+dialog --msgbox "Done! Remove the USB and reboot.\n\nLogin: $USERN\nLAN gateway: $LANIP (SSH enabled)" 10 50
+clear

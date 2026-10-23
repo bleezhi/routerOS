@@ -1,0 +1,25 @@
+name: Build router ISO
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "Distro name"
+        default: "RouterOS"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+    steps:
+      - name: Install git
+        run: pacman -Syu --noconfirm git
+      - uses: actions/checkout@v4
+      - name: Build ISO
+        run: |
+          chmod +x build.sh router-install
+          ./build.sh "${{ github.event.inputs.name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: router-iso
+          path: out/*.iso
